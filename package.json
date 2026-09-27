@@ -2,7 +2,7 @@
   "name": "vennix-storefront",
   "version": "2.0.0",
   "private": true,
-  "description": "Vennix \u2014 premium editorial storefront for Shopify. The Node presentation layer renders the storefront and hands cart/checkout to Shopify (Storefront API 2026-07); the OS 2.0 theme in shopify-theme/ is the in-Shopify twin. Zero runtime dependencies.",
+  "description": "Vennix — premium editorial storefront for Shopify. The Node presentation layer renders the storefront and hands cart/checkout to Shopify (Storefront API 2026-07); the OS 2.0 theme in shopify-theme/ is the in-Shopify twin. Zero runtime dependencies.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -23,7 +23,7 @@
     "fixtures": "node scripts/build-fixtures.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "24.x"
   },
   "keywords": [
     "shopify",
