@@ -558,7 +558,7 @@ function healthPayload() {
 
 /* ---------------------------------- boot ----------------------------------- */
 
-async function boot() {
+async function initialize() {
   const cfg = shopifyConfig.getConfig();
 
   if (cfg.demo) {
@@ -568,8 +568,8 @@ async function boot() {
     client.setEndpoint(gateway.url);
     console.log('[vennix] DEMO MODE — no SHOPIFY_STORE_DOMAIN configured.');
     console.log('[vennix] Mock Shopify gateway on an ephemeral port; using the committed fixture catalog.');
-    console.log('[vennix] Set SHOPIFY_STORE_DOMAIN + SHOPIFY_STOREFRONT_ACCESS_TOKEN to go live.');
   } else {
+    DEMO_MODE = false;
     console.log(`[vennix] Live mode — catalog and carts come from ${cfg.domain} (Storefront API ${cfg.version}).`);
     const result = await preflight();
     if (result.checks && result.checks.length) {
@@ -577,28 +577,64 @@ async function boot() {
       console.log(formatPreflight(result));
     }
     if (!result.ok) {
-      console.error('\n[vennix] Shopify connection failed — refusing to start a storefront that cannot sell.');
-      console.error('[vennix] Fix the credentials above (see docs/SETUP.md) and restart.');
-      process.exit(1);
+      throw new Error('Shopify connection preflight failed');
     }
   }
 
-  // Warm the catalog cache so the first page does not pay for it. It can be
-  // skipped with VENNIX_SKIP_WARMUP=1 (the live-verification child uses it so
-  // it can listen before pulling a large live catalogue) — pages fetch the
-  // chrome lazily if a request lands before the warm-up finishes.
   if (process.env.VENNIX_SKIP_WARMUP !== '1') {
-    try { await layout.prepareChrome(); } catch (err) { console.error('[vennix] catalog warm-up failed:', err.message); }
+    try { await layout.prepareChrome(); } catch (err) {
+      console.error('[vennix] catalog warm-up failed:', err.message);
+    }
+  }
+}
+
+let initialization = null;
+function ensureInitialized() {
+  if (!initialization) {
+    initialization = initialize().catch(err => {
+      initialization = null;
+      throw err;
+    });
+  }
+  return initialization;
+}
+
+async function vercelHandler(req, res) {
+  try {
+    await ensureInitialized();
+  } catch (err) {
+    console.error('[vennix] initialization failed:', err && err.message ? err.message : err);
+    return refuse(res, 503, 'Storefront temporarily unavailable.');
   }
 
+  let url;
+  try {
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    url = new URL(req.url || '/', `${proto}://${req.headers.host || 'localhost'}`);
+  } catch {
+    return refuse(res, 400, 'Bad request');
+  }
+
+  const query = Object.fromEntries(url.searchParams.entries());
+  const nonce = security.newNonce();
+  return security.runWithRequest(
+    { req, res, nonce, startedAt: Date.now() },
+    () => handle(req, res, url, query).catch(err =>
+      serverError({
+        req, res, url,
+        cart: { lines: [] },
+        chrome: { products: [], collections: [] },
+        settings: settings.get()
+      }, err)
+    )
+  );
+}
+
+async function boot() {
+  await ensureInitialized();
+
   const server = http.createServer((req, res) => {
-    let url;
-    try { url = new URL(req.url, `http://${req.headers.host || 'localhost'}`); } catch { res.writeHead(400); return res.end('Bad request'); }
-    const query = Object.fromEntries(url.searchParams.entries());
-    const nonce = security.newNonce();
-    security.runWithRequest({ req, res, nonce, startedAt: Date.now() }, () => {
-      handle(req, res, url, query).catch(err => serverError({ req, res, url, cart: { lines: [] }, chrome: { products: [], collections: [] }, settings: settings.get() }, err));
-    });
+    vercelHandler(req, res);
   });
 
   server.keepAliveTimeout = 65000;
@@ -623,9 +659,11 @@ async function boot() {
   }
 }
 
-boot().catch(err => {
-  console.error('[vennix] failed to boot:', err && err.message ? err.message : err);
-  process.exit(1);
-});
+if (require.main === module) {
+  boot().catch(err => {
+    console.error('[vennix] failed to boot:', err && err.message ? err.message : err);
+    process.exit(1);
+  });
+}
 
-module.exports = { boot, handle, DEMO_MODE: () => DEMO_MODE };
+module.exports = { boot, handle, vercelHandler, DEMO_MODE: () => DEMO_MODE };
