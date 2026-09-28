@@ -25,6 +25,7 @@ const { URL } = require('url');
 // Load .env / .env.local first so real credentials can live outside git.
 require('./lib/env').loadEnv({ cwd: __dirname, quiet: process.env.NODE_ENV === 'test' });
 
+const auth = require('./lib/auth');
 const settings = require('./lib/settings');
 const leads = require('./lib/leads');
 const cartLib = require('./lib/cart');
@@ -144,8 +145,16 @@ function notModified(res, etag, cacheControl) {
  */
 async function sendFile(req, res, filePath, { longCache = false } = {}) {
   let stat;
-  try { stat = await fs.promises.stat(filePath); } catch { res.writeHead(404); res.end('Not found'); return; }
-  if (!stat.isFile()) { res.writeHead(404); res.end('Not found'); return; }
+  const missing = () => {
+    res.writeHead(404, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    res.end('Not found');
+  };
+  try { stat = await fs.promises.stat(filePath); } catch { return missing(); }
+  if (!stat.isFile()) return missing();
 
   const ext = path.extname(filePath).toLowerCase();
   const contentType = MIME[ext] || 'application/octet-stream';
@@ -240,9 +249,30 @@ function sameOrigin(req) {
   return true; // curl / non-browser clients without these headers
 }
 
-function refuse(res, status, message) {
-  res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+function refuse(res, status, message, extra = {}) {
+  // Short plain-text refusals still get nosniff: they are responses on the
+  // storefront origin and nothing here should ever be reinterpreted as script.
+  res.writeHead(status, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Length': Buffer.byteLength(message),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    ...extra
+  });
   res.end(message);
+}
+
+/** Shared 429 shape: `Retry-After` on every rejection, so clients back off. */
+function tooManyRequests(res, retryAfterSeconds) {
+  res.writeHead(429, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Retry-After': String(retryAfterSeconds),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  res.end('Too many requests — slow down a moment.');
 }
 
 /** Pages that must never be indexed (cart, checkout, internal search, account). */
@@ -360,9 +390,16 @@ async function handle(req, res, url, query) {
 
   // static assets
   if (pathname.startsWith('/css/') || pathname.startsWith('/js/') || pathname.startsWith('/images/') || pathname === '/favicon.svg' || pathname === '/apple-touch-icon.png') {
-    const safe = path.normalize(pathname).replace(/^(\.\.[/\\])+/, '');
-    const filePath = path.join(PUBLIC_DIR, safe);
-    if (!filePath.startsWith(PUBLIC_DIR)) return refuse(res, 400, 'Bad request');
+    let decoded;
+    try { decoded = decodeURIComponent(pathname); } catch { return refuse(res, 400, 'Bad request'); }
+    const safe = path.normalize(decoded).replace(/^(\.\.[/\\])+/, '');
+    const filePath = path.resolve(PUBLIC_DIR, '.' + path.posix.sep + safe.replace(/^[/\\]+/, ''));
+    // Containment by relative path, not by string prefix: `startsWith(PUBLIC_DIR)`
+    // would also accept a sibling directory such as `public-evil`.
+    const inside = path.relative(PUBLIC_DIR, filePath);
+    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) {
+      return refuse(res, 400, 'Bad request');
+    }
     return sendFile(req, res, filePath, { longCache: pathname.startsWith('/images/') });
   }
   if (pathname === '/robots.txt') {
@@ -382,8 +419,7 @@ async function handle(req, res, url, query) {
 
   // Global per-IP request limit (blunt, protects the Node process itself).
   if (!limiter.allow(req, 'requests', { windowMs: 60_000, max: 900 })) {
-    res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60', 'Cache-Control': 'no-store' });
-    return res.end('Too many requests — slow down a moment.');
+    return tooManyRequests(res, 60);
   }
 
   // Every browser session gets a CSRF token to echo back on writes.
@@ -400,8 +436,7 @@ async function handle(req, res, url, query) {
       if (!check.ok) return refuse(res, 403, 'CSRF token missing or invalid.');
     }
     if (!limiter.allow(req, 'writes', { windowMs: 10_000, max: 120 })) {
-      res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '10', 'Cache-Control': 'no-store' });
-      return res.end('Too many requests — slow down a moment.');
+      return tooManyRequests(res, 10);
     }
   }
 
@@ -552,7 +587,11 @@ function healthPayload() {
     uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
     cache: catalog.cacheStats(),
     shopify: client.getMetrics(),
-    locks: locks.stats()
+    locks: locks.stats(),
+    // A capture that cannot be persisted is an outage, not a warning — alert on
+    // `leads.writable === false` or any `leads.writeFailures`.
+    leads: leads.stats(),
+    proxy: { trustForwardedHeaders: auth.trustsProxy(), detected: auth.onProxyPlatform() || null }
   };
 }
 
@@ -586,16 +625,48 @@ async function initialize() {
       console.error('[vennix] catalog warm-up failed:', err.message);
     }
   }
+
+  // Fail loudly about the two things that look fine until a human notices the
+  // missing data: leads that cannot be written, and a proxy whose forwarded
+  // headers we were told to ignore.
+  const sink = leads.checkWritable();
+  if (!sink.writable) {
+    console.warn(`[vennix] lead capture is NOT durable: ${sink.file} is not writable (${sink.reason}).`);
+    console.warn('[vennix] visitors will get a thank-you and the record will be dropped. Set LEADS_DIR to writable');
+    console.warn('[vennix] persistent storage, or wire lib/leads.js to your own sink.');
+  }
+  const platform = auth.onProxyPlatform();
+  if (platform && !auth.trustsProxy()) {
+    console.warn(`[vennix] running on ${platform} with TRUST_PROXY explicitly off: every visitor shares one`);
+    console.warn('[vennix] rate-limit bucket (900 req/min for the whole deployment). Unset TRUST_PROXY to auto-detect.');
+  }
 }
 
+/**
+ * Boot-once initialization, shared by every request.
+ *
+ * A failed init is remembered for `RETRY_COOLDOWN_MS` rather than retried per
+ * request: while Shopify is refusing connections, a request-driven retry storm
+ * (each attempt doing DNS + backoff retries) multiplies the outage and eats the
+ * function's time budget. Inside the cooldown every request gets the same
+ * failure immediately; the first one after it tries again.
+ */
 let initialization = null;
+let initError = null;
+let initRetryAt = 0;
+const RETRY_COOLDOWN_MS = Number(process.env.VENNIX_INIT_RETRY_MS || 5000);
+
 function ensureInitialized() {
-  if (!initialization) {
-    initialization = initialize().catch(err => {
+  if (initialization) return initialization;
+  if (initError && Date.now() < initRetryAt) return Promise.reject(initError);
+  initialization = initialize()
+    .then(() => { initError = null; })
+    .catch(err => {
+      initError = err instanceof Error ? err : new Error(String(err));
+      initRetryAt = Date.now() + RETRY_COOLDOWN_MS;
       initialization = null;
-      throw err;
+      throw initError;
     });
-  }
   return initialization;
 }
 
@@ -604,12 +675,19 @@ async function vercelHandler(req, res) {
     await ensureInitialized();
   } catch (err) {
     console.error('[vennix] initialization failed:', err && err.message ? err.message : err);
-    return refuse(res, 503, 'Storefront temporarily unavailable.');
+    return refuse(res, 503, 'Storefront temporarily unavailable.', { 'Retry-After': String(Math.ceil(RETRY_COOLDOWN_MS / 1000)) });
   }
 
   let url;
   try {
-    const proto = req.headers['x-forwarded-proto'] || 'https';
+    // Only a trusted proxy's forwarded protocol is believed; a direct socket is
+    // http unless TLS terminated it here. (Nothing renders an absolute URL from
+    // this — canonicals come from PUBLIC_SITE_DOMAIN — but the request URL
+    // should not be a place where an unvalidated header is trusted.)
+    const forwarded = auth.trustsProxy()
+      ? String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
+      : '';
+    const proto = forwarded === 'https' || (!forwarded && req.socket && req.socket.encrypted) ? 'https' : 'http';
     url = new URL(req.url || '/', `${proto}://${req.headers.host || 'localhost'}`);
   } catch {
     return refuse(res, 400, 'Bad request');

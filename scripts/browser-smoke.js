@@ -24,8 +24,15 @@ function loadJsdom() {
   for (const candidate of candidates) {
     try { return require(candidate); } catch (error) { /* keep looking */ }
   }
-  console.log('jsdom not installed — skipping browser test.');
-  console.log('  install with: mkdir -p /tmp/jsdom && cd /tmp/jsdom && npm install jsdom');
+  // A suite that did not run is not a suite that passed. Locally the missing
+  // dev-dependency is a skip; in CI it is an error, because that is where a
+  // silent skip would turn the green checkmark into a lie.
+  console.warn('\n  ! SKIPPED — the browser click test did not run: jsdom is not installed.');
+  console.warn('      install with: npm install --no-save jsdom   (or: mkdir -p /tmp/jsdom && cd /tmp/jsdom && npm install jsdom)\n');
+  if (process.env.CI === 'true' || process.env.VENNIX_REQUIRE_BROWSER_TEST === '1') {
+    console.error('  ✗ jsdom is required in CI (the workflow installs it). Failing instead of reporting a false pass.');
+    process.exit(1);
+  }
   process.exit(0);
 }
 

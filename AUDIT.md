@@ -1,15 +1,237 @@
 # Vennix Storefront — Audit Report
 
-> **Two audits live in this file.**
+> **Three audits live in this file.**
 >
-> 1. **[Production-readiness audit — 2026-09-23](#production-readiness-audit--2026-09-23)** — the
->    current one: security, caching, failure states, mobile, SEO, a11y and
->    performance for the storefront *as it now is* (Shopify = commerce backend,
->    this repo = presentation).
-> 2. **[Historical audit — 2026-09-21](#historical-audit--2026-09-21-pre-shopify-migration)** — the
+> 1. **[Production-readiness audit — 2026-09-28](#production-readiness-audit--2026-09-28)** — the
+>    current one: re-verifies every claim of the previous audit against the
+>    code as it stands (including the new Vercel entry point), finds the places
+>    where the claims were true on a laptop and false in production, and fixes
+>    them with regression tests.
+> 2. **[Production-readiness audit — 2026-09-23](#production-readiness-audit--2026-09-23)** — the
+>    previous full pass: security, caching, failure states, mobile, SEO, a11y
+>    and performance for the storefront (Shopify = commerce backend, this repo
+>    = presentation). Every finding re-checked on 2026-09-28; see §0 of the
+>    current audit for what still holds and what did not.
+> 3. **[Historical audit — 2026-09-21](#historical-audit--2026-09-21-pre-shopify-migration)** — the
 >    original review of the retired custom commerce backend. Kept for the
 >    record; every finding in it was either fixed at the time or made moot by
 >    moving products, carts, checkout, orders and customers into Shopify.
+
+---
+
+<a name="production-readiness-audit--2026-09-28"></a>
+# Production-readiness audit — 2026-09-28
+
+Scope: the whole shipped surface — `server.js`, `lib/`, `public/`, `scripts/`,
+`api/index.js`, `vercel.json`, the workflows — on branch
+`arena/01a0e597-vennix-storefront`, Node v22.22.3 locally, `nodejs24.x` on
+Vercel, Shopify Storefront API 2026-07. Nothing had changed in `lib/` since the
+2026-09-23 audit except the Vercel entry point (`api/index.js`, `vercel.json`,
+`vercelHandler`) — and that entry point is exactly where this pass found the
+previous audit's assumptions broken.
+
+Method: re-run the whole suite (`npm run verify` — green, but the browser test
+was **silently skipped** without jsdom, reported below), then attack every
+"✅ Hardened" claim with an adversarial reproduction of the environment it
+would be deployed into. Four claims broke; each fix below landed with an
+automated assertion so it cannot regress. All suites now: **192**
+data-layer · **118** smoke · **62** browser · **45** feature · **130** a11y ·
+**9** secret-scan · 27 rendered pages · 43 crawled pages · 13 theme checks ·
+doctor 14 ok / 0 errors.
+
+## Scoreboard
+
+| # | Area | Status before | Status after | What changed |
+| --- | --- | --- | --- | --- |
+| 1 | Rate limiting behind a proxy | ❌ **Broken in production** | ✅ Fixed + proven | shared-bucket collapse and XFF spoofing fixed; per-visitor throttling asserted behind a live proxied server |
+| 2 | Cart-burst session key | ❌ **Collision behind a proxy** | ✅ Fixed + proven | key now uses the real client IP; an unidentifiable visitor matches no one |
+| 3 | Lead capture durability | ❌ **Silently lost on serverless** | ✅ Reported + gated | write failures counted on `/healthz`, boot warning, doctor error |
+| 4 | Vercel entry point wiring | ❌ **Broken 3 ways** | ✅ Fixed + gated | runtime matches engines, cold-start storm tamed, state caveat documented and checked |
+| 5 | Static file containment | ⚠️ Fragile | ✅ Hardened | prefix check → real containment; `%2e%2e` decoded; hard 404s carry nosniff |
+| 6 | CI: engines vs runtime | ⚠️ Contradicted | ✅ Aligned | `engines: >=20`; matrix on 20.x + 24.x; live job on the shipping runtime; a skipped browser test fails CI |
+| 7 | Refusal responses | ⚠️ Inconsistent | ✅ Hardened | every 4xx/429 carries nosniff + framing deny; `Retry-After` on serverless init 503s |
+| 8 | The other twelve 2026-09-23 claims | ✅ | ✅ Re-verified | CSRF, cookies, XSS/CSP, checkout allowlist, locking, caching, API errors, failure pages, mobile, SEO, a11y, performance — all still hold; see §0 |
+
+---
+
+## 0. Re-verification of the 2026-09-23 audit
+
+Every claim was re-tested, not re-read. Result: the twelve claims about the
+*code* hold. The claims about the *deployment environment* did not — a lesson
+this audit's fixes encode as checks:
+
+- **CSRF, cookies, checkout allowlist, XSS/CSP, escaping** — all assertions
+  still pass; no regression found.
+- **Inventory races / locking** — `withLock` still serialises per cart. But the
+  *session→cart memory* that prevents parallel first-add orphaning keyed on the
+  raw socket address — broken behind any proxy (finding §2).
+- **Rate limiting** — the limiter itself is fine; its *key* was the raw socket
+  address, which behind a proxy is one address for everybody (finding §1).
+- **Caching, compression, ETag/304, SEO, a11y, mobile, failure pages** — all
+  re-verified by the suites, unchanged.
+- **"Verified by `npm run verify`"** — the fine print lied in one place:
+  `browser:test` exits 0 with `jsdom not installed — skipping`. CI installed
+  jsdom, so the workflow was honest; a laptop `npm run verify` was not. A skip
+  is now loud locally and **fails in CI**, and this audit's run includes the
+  previously-skipped 62 browser assertions.
+
+---
+
+## 1. Rate limiting collapsed to one bucket per deployment (Critical in production)
+
+**Found:** `lib/ratelimit.js` keyed buckets on `req.socket.remoteAddress`
+unless `TRUST_PROXY=1`. On the Vercel entry point (and any platform proxy) the
+socket address is the platform's — identical for every visitor. Proven: 950
+distinct visitors, one request each → **50 of them 429'd** by the global
+900/min limiter; with the contact form (3 per 10 min) the **4th visitor
+site-wide** is refused. Worse, with `TRUST_PROXY=1` the code took the
+**leftmost** `X-Forwarded-For` entry — the one header a client fully controls.
+Proven: one attacker sending `X-Forwarded-For: <random>, <real>` made **100 of
+100** discount-code guesses land in fresh buckets (limit: 10/min). An
+unauthenticated, enumerable guessing surface with no effective limit.
+
+**Fixed** (`lib/auth.js`, one `clientIp()` used by the limiter, the session key
+and `security.js`):
+
+- Trust is a single decision: `TRUST_PROXY=1` on, `0` off, unset → auto-detect
+  platform proxies (Vercel, Render, Fly.io, Railway) — the platforms whose edge
+  always fronts every request. A bare `node server.js` still trusts nothing.
+- Behind a proxy: `x-real-ip` first (the platform overwrites it; a client
+  cannot), else the **rightmost** `X-Forwarded-For` hop (what an appending
+  proxy puts last = the real client), else the socket.
+- No proxy trusted: the socket address, and a client-supplied header changes
+  nothing.
+
+**Verified by:** `scripts/test-shopify.js` ("Client identity, proxy trust and
+rate limiting" — 18 assertions incl. the forged-first-hop case), and
+`scripts/smoke.js` boots a **second live server with `TRUST_PROXY=1`** and
+proves six visitors keep separate allowances, a seventh is unaffected, one
+visitor over the limit is refused, and a forged first hop buys nothing.
+
+## 2. Two strangers could share one cart-burst session (High)
+
+**Found:** `lib/locks.js` `sessionKey()` hashed the raw socket IP + user-agent
++ per-tab id. Behind a proxy, the IP term was constant, so two visitors with a
+common user-agent and no `vnx_sid` (curl, prefetchers, privacy browsers, first
+paint) hashed to the **same key** — reproduced with Chrome/140 on Windows.
+Whoever's add ran first had their brand-new cart id remembered for the other
+visitor (750 ms–2 s): the second visitor's items land in the first visitor's
+cart. Also, with `TRUST_PROXY=1` the limiter saw forwarded IPs while the lock
+still saw the socket — the two halves of the same feature disagreed about who
+the visitor was.
+
+**Fixed:** the key uses the shared `clientIp()`; and a request that cannot be
+distinguished at all (no sid, unknown IP) returns `null`, which creates a fresh
+cart — the worst case is an orphaned cart, never a shared one. (The old code
+also treated the literal string `"undefined"` as an IP; gone.)
+
+**Verified by:** `scripts/test-shopify.js` ("two visitors behind one proxy no
+longer share a cart-burst key", "an unidentifiable visitor is never matched to
+someone else's cart").
+
+## 3. Lead captures were silently dropped on read-only filesystems (High on serverless)
+
+**Found:** reproduced on a read-only `LEADS_DIR`: `insert()` returned success,
+the shopper got the thank-you, the write failed in a debounced timer, the only
+trace was an unstructured `console.error`, and nothing — not the API response,
+not `/healthz`, not the doctor — reported it. On Vercel's read-only functions
+**every newsletter signup, contact message, review and back-in-stock request
+would be accepted and lost, invisibly**.
+
+**Fixed** (`lib/leads.js`): durability is now reportable — `stats()` exposes
+`writable`, `writeFailures`, `lastError`, `lastWriteAt` and is surfaced on
+`/healthz` (`leads`), boot warns once per minute with the remedy, `saveNow()`
+returns a boolean, and `npm run doctor` **errors** on an unwritable sink in
+production. The shopper never sees a 500 — a lead that cannot persist must not
+break the page — but it can no longer fail silently.
+
+**Verified by:** `scripts/test-shopify.js` ("Lead capture durability" — runs a
+child process against a read-only directory and asserts the failure is
+returned, counted and flagged), smoke asserts `/healthz` reports a healthy sink
+honestly.
+
+## 4. The Vercel entry point was broken three ways (High for the deploy it was added for)
+
+The last commit before this audit added `api/index.js` + `vercel.json` with no
+test, no doctor coverage and no documentation. Checking it found:
+
+1. **Runtime contradiction** — `vercel.json` pins `nodejs24.x` while
+   `package.json` declared `engines: "24.x"` yet CI verified on Node 20. The
+   shipped runtime was the one runtime nothing ever tested. Fixed: engines
+   widened to the real floor (`>=20`), CI now runs the offline suites on a
+   **20.x + 24.x matrix**, `verify:live` runs on 24.x (the shipping runtime),
+   and the doctor errors if `vercel.json`'s runtime ever disagrees with the
+   manifest again.
+2. **Cold-start retry storm** — `vercelHandler` re-ran `initialize()` on every
+   request after a failure; with Shopify unreachable each request repeats DNS +
+   preflight + backoff retries inside the function's time budget, multiplying
+   the outage. Fixed: a failed init is remembered for `VENNIX_INIT_RETRY_MS`
+   (default 5 s) and answered immediately with a 503 that carries
+   `Retry-After`.
+3. **Undocumented state model** — the catalog cache, limiter and locks are per
+   process; on Vercel every instance has its own. That is acceptable (Shopify
+   stays authoritative; throttling is merely weaker), but it was nowhere
+   written down. Now documented in `docs/SETUP.md`, `.env.example`, printed as
+   a doctor warning on detected platforms, and `/healthz` exposes
+   `proxy.trustForwardedHeaders` + which platform was detected.
+
+Also added to the doctor: `vercel.json` rewrites must keep excluding `/api`
+(the one path that must not be double-routed).
+
+## 5. Static file containment was one refactor away from a path traversal (Medium)
+
+**Found:** the guard was
+`path.normalize(pathname)…; path.join(PUBLIC_DIR, safe); startsWith(PUBLIC_DIR)`
+— the classic prefix check, which accepts a sibling `public-evil/`, and it
+never percent-decoded, so `%2e%2e%2f` sailed through `normalize` untouched
+(encoders differ on whether the router decodes first; nothing here guaranteed
+it). Not exploitable as shipped (Node's router does not decode), but one
+routing change away from serving `server.js`, `.env` or the fixture to anyone.
+
+**Fixed:** decode explicitly (bad encoding → 400), resolve, then verify with
+`path.relative` — containment by real path math, not a string prefix. Static
+404s now carry `nosniff` instead of a bare 404 that sniffed as text.
+
+**Verified by:** `scripts/smoke.js` ("Static file containment") — six escape
+payloads (`%2e%2e` variants, NUL, sibling-prefix) must serve nothing outside
+`public/` while real and encoded-but-legitimate assets still serve.
+
+## 6. Cross-cutting hardening (Low)
+
+- **Every refusal hardened**: `refuse()` and both 429 paths (server + API) now
+  carry `X-Content-Type-Options: nosniff`, framing deny and referrer policy;
+  the serverless-init 503 carries `Retry-After`. (`lib/api.js`'s 429 was the
+  one response in the app with no nosniff.)
+- **`X-Forwarded-Proto` is only read when the proxy is trusted** in
+  `vercelHandler` too (it previously believed the header unconditionally when
+  building the request URL).
+- **CI honesty**: a skipped browser test warns locally and **fails in CI**
+  (`CI=true` or `VENNIX_REQUIRE_BROWSER_TEST=1`) — a suite that did not run can
+  no longer masquerade as a pass. This audit's run is the first to include the
+  62 browser assertions.
+- **Engines tell the truth**: `>=20` matches what the suites actually prove.
+
+## Residual risks (honest list, replacing the 2026-09-23 one)
+
+1. **Serverless state is per instance** (cache, limiter, locks). Single-host
+   deploys are unaffected; on Vercel expect weaker cross-instance throttling.
+   Shopify stays authoritative for cart/checkout either way.
+2. **Leads still land on local disk by default** — but an unwritable or
+   non-persistent sink is now *visible* (`/healthz`, boot warning, doctor
+   error) instead of silent. Wire `lib/leads.js` to a real sink before you
+   market off the list.
+3. **Auto-detected proxy trust assumes the platform sanitises forwarded
+   headers.** Vercel/Render/Fly/Railway do (and overwrite `x-real-ip`); that is
+   why auto-trust is limited to them and why the rightmost XFF hop — not the
+   client-chosen first one — is read. On exotic proxies, set `TRUST_PROXY`
+   explicitly.
+4. **Rate limiting is still in-process.** Fine for one instance; multi-host
+   needs sticky sessions or a proxy limiter (unchanged from the last audit).
+5. **The catalog cache can still be 15 s stale** on price/stock display; cart
+   and checkout are always live (unchanged).
+6. **CSP still allows inline `style` attributes** for the design-system custom
+   properties (unchanged).
+7. **Device testing on real hardware** is still on the human list (unchanged).
 
 ---
 
@@ -18,8 +240,19 @@
 
 Scope: the Node storefront (`server.js`, `lib/`, `public/`) as the production
 front end for an existing Shopify store. Date: 2026-09-23. Branch:
-`arena/01a0cdc7-vennix-storefront`. Node 22 (project requires `>=18`). Shopify
-Storefront API **2026-07** (current stable, supported until 2027-07-16).
+`arena/01a0cdc7-vennix-storefront`. Node 22 (project floor now `>=20` — see the
+2026-09-28 audit §4). Shopify Storefront API **2026-07** (current stable,
+supported until 2027-07-16).
+
+> **Read together with the [2026-09-28 audit](#production-readiness-audit--2026-09-28).**
+> Everything in this section was re-verified there. Four findings did not
+> survive contact with a proxy-fronted deployment: the rate-limit *key* (§4
+> below — one shared bucket behind a platform proxy, and the forgeable first
+> XFF hop was trusted), the cart-burst *session key* (§7 — strangers could
+> collide behind a proxy), "verified by `npm run verify`" (the browser test
+> could silently skip), and lead durability (§10/§12 — unwritable sinks were
+> silent). All fixed on 2026-09-28 with regression tests; the text below is
+> kept as written.
 
 Method: read every module in the request path, then convert each conclusion
 into an automated assertion so it cannot silently regress. Every "status"

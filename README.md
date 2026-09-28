@@ -122,12 +122,12 @@ npm run verify
 | Suite | What it proves |
 | --- | --- |
 | `npm run check` | every live module loads cleanly |
-| `npm run test:shopify` | Shopify data layer (163 assertions) against the mock gateway: config guards, checkout-URL allowlist, cookie/CSRF helpers, pinned-document hygiene, schema-conformance logic, normalization, catalog reads, search, recommendations, all cart mutations, inventory rules, discount validation, concurrency |
+| `npm run test:shopify` | Shopify data layer (192 assertions) against the mock gateway: config guards, checkout-URL allowlist, cookie/CSRF helpers, pinned-document hygiene, schema-conformance logic, normalization, catalog reads, search, recommendations, all cart mutations, inventory rules, discount validation, concurrency |
 | `npm run doctor` | configuration and deployment sanity (no network): mode, API version, proxy, CSP, canonical domain, repo hygiene |
 | `npm run secrets` | no credential can reach a browser — static scan of every shipped file, plus a runtime crawl with a fake token in the environment |
 | `npm run check:render` | 27 page shapes render without crash markers, self-boots the server |
 | `npm run theme:check` | the OS 2.0 theme's Liquid/JSON/i18n/settings parity |
-| `npm run smoke` | 100 HTTP end-to-end assertions: pages, cart API, checkout handoff, leads, CSP nonces, CSRF tokens, rate limits, output encoding, cookie flags, compression, ETag/304, SEO payloads |
+| `npm run smoke` | 118 HTTP end-to-end assertions: pages, cart API, checkout handoff, leads, CSP nonces, CSRF tokens, rate limits (incl. per-visitor throttling behind a proxy), static-file containment, output encoding, cookie flags, compression, ETag/304, SEO payloads, health telemetry |
 | `npm run features` | 45 feature-rule assertions: monogramming, size finder, shop-the-look, alerts, filtering/sorting/load-more, free-shipping promise |
 | `npm run links` | dead-link crawl over every internal href |
 | `npm run a11y` | 130 accessibility assertions over rendered HTML: landmarks, heading order, alt text, control labelling, dialogs, live regions |
@@ -135,7 +135,8 @@ npm run verify
 | `npm run verify:live` | **against your real store**: schema conformance (every field and argument we send must exist on 2026-07), products, prices, inventory, collections, search, recommendations, cart mutations, discount validation, checkout handoff, Shopify-owned accounts/orders, no local commerce store, live pages with no demo banner |
 
 `browser:test` needs jsdom once: `npm install --no-save jsdom` (or in
-`/tmp/jsdom` — the script finds it there). CI installs it automatically.
+`/tmp/jsdom` — the script finds it there). CI installs it automatically, and in
+CI a missing jsdom **fails** the run — a suite that did not run is not a pass.
 
 ---
 

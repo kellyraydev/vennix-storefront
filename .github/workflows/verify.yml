@@ -8,16 +8,23 @@ on:
 
 jobs:
   verify:
-    name: Storefront, Shopify data layer, theme and end-to-end checks
+    name: Storefront, Shopify data layer, theme and end-to-end checks (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # Keep going when one runtime fails: the two versions here are the
+      # supported floor and the version that actually ships (vercel.json →
+      # nodejs24.x), and both answers are useful.
+      fail-fast: false
+      matrix:
+        node: ['20.x', '24.x']
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node }}
 
       # jsdom is a dev-only dependency for the browser click test; the app
       # itself stays dependency-free.
@@ -77,7 +84,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # the runtime that ships (vercel.json -> nodejs24.x): verify:live must
+          # prove the store works on THAT runtime, not on an older one.
+          node-version: '24.x'
 
       - name: Verify against the live store
         env:

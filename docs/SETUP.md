@@ -172,12 +172,19 @@ same Shopify data — don't let both render the same domain.
 ## Production hosting notes
 
 - Bind `HOST=0.0.0.0`, put TLS termination in front, set `NODE_ENV=production`
-  (cookies become `Secure`, HSTS is sent, demo mode is refused) and
-  `TRUST_PROXY=1` behind a reverse proxy so rate limiting keys on
-  `X-Forwarded-For` and cookies go `Secure` on `X-Forwarded-Proto: https`.
+  (cookies become `Secure`, HSTS is sent, demo mode is refused).
+- **Behind a reverse proxy, forwarded headers must be trusted exactly once.**
+  `TRUST_PROXY=1` turns trust on; `TRUST_PROXY=0` forces it off; unset, the
+  app auto-detects platform proxies (Vercel, Render, Fly.io, Railway). With
+  trust on, the client address comes from `x-real-ip` or the **rightmost**
+  `X-Forwarded-For` hop — never the client-forgeable first entry — and it is
+  the single answer shared by the rate limiter, the cart-burst session key and
+  `X-Forwarded-Proto` (so cookies go `Secure`). With trust off on a proxied
+  deploy, every visitor shares one rate-limit bucket (900 req/min for the whole
+  deployment) — `npm run doctor` errors on exactly that combination.
 - `PUBLIC_SITE_DOMAIN` should match the public hostname for canonical URLs;
   the sitemap is generated live from the Shopify catalog.
-- Cookies: with `NODE_ENV=production` (or `TRUST_PROXY=1` plus
+- Cookies: with `NODE_ENV=production` (or a trusted proxy plus
   `X-Forwarded-Proto: https`) the cart and CSRF cookies are `Secure`. In
   production they also carry the `__Host-` prefix, so no subdomain can set or
   shadow them; set `COOKIE_HOST_PREFIX=off` if you ever need the plain names,
@@ -187,8 +194,20 @@ same Shopify data — don't let both render the same domain.
   catalog is served for up to five minutes before the 503 page takes over.
 - Local state is limited to non-commerce leads in `data/leads.json`
   (newsletter, contact messages, back-in-stock alerts, review submissions for
-  moderation). Mount that path on persistent storage if you need the captures
-  to survive deploys, or wire `lib/leads.js` to your own sink.
+  moderation). Mount that path on persistent storage (or set `LEADS_DIR`) if
+  you need the captures to survive deploys, or wire `lib/leads.js` to your own
+  sink. **On read-only deployment filesystems (e.g. Vercel functions) the file
+  cannot be written at all**: the capture is still accepted and answered with a
+  thank-you, but the record is dropped — `/healthz` reports
+  `leads.writable: false` and a `leads.writeFailures` count, boot logs a
+  warning, and `npm run doctor` errors on it in production. Point `LEADS_DIR`
+  at writable persistent storage before relying on any capture.
+- **Serverless (Vercel via `api/index.js` + `vercel.json`)**: the catalog
+  cache, the rate limiter and the cart-burst locks are per process, so each
+  function instance has its own — expect weaker per-IP throttling across
+  instances and no cross-instance single-flight (Shopify stays authoritative
+  either way). A failed Shopify preflight is retried at most once every
+  `VENNIX_INIT_RETRY_MS` (default 5s) instead of per request.
 
 ### What ships switched on
 

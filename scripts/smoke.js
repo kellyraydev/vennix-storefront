@@ -9,7 +9,8 @@
  *
  * Usage: node scripts/smoke.js [baseUrl]
  */
-const { ensureBase } = require('./helpers');
+const fs = require('fs');
+const { ensureBase, startTestServer } = require('./helpers');
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -252,6 +253,85 @@ function expect(label, condition, detail = '') {
   const limited = flood.find(r => r.status === 429);
   expect('a flood of submissions is throttled', !!limited, `statuses ${flood.map(r => r.status).join(',')}`);
   expect('the 429 says when to retry', !!limited && !!limited.headers.get('retry-after'), limited && String(limited.headers.get('retry-after')));
+  expect('a refusal says nosniff too', limited.headers.get('x-content-type-options') === 'nosniff');
+  expect('a cross-origin refusal says nosniff too', csrf.headers.get('x-content-type-options') === 'nosniff');
+
+  console.log('\nPer-visitor throttling behind a proxy');
+  // The whole point of trusting a proxy is that the limiter still counts per
+  // *visitor*. Keyed on the socket instead, every visitor shares one bucket and
+  // a busy deploy starts 429-ing innocent traffic (and one attacker mints
+  // unlimited buckets by forging the first X-Forwarded-For entry).
+  const os = require('os');
+  const proxyLeadsDir = fs.mkdtempSync(require('path').join(os.tmpdir(), 'vennix-proxy-leads-'));
+  const proxyServer = await startTestServer({ env: { TRUST_PROXY: '1', LEADS_DIR: proxyLeadsDir } });
+  try {
+    const asVisitor = (xff, email) => fetch(`${proxyServer.base}/api/newsletter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: proxyServer.base, 'X-Forwarded-For': xff },
+      body: JSON.stringify({ email })
+    }).then(r => r.status);
+    const six = [];
+    for (let i = 0; i < 6; i++) six.push(await asVisitor(`203.0.113.${i + 1}`, `proxy-visitor-${i}@example.com`));
+    expect('six distinct visitors each keep their own allowance', six.every(s => s === 200), six.join(','));
+    const seventh = await asVisitor('198.51.100.7', 'proxy-visitor-7@example.com');
+    expect('a seventh visitor is not throttled by the other six', seventh === 200, String(seventh));
+    const sameVisitor = [];
+    for (let i = 0; i < 8; i++) sameVisitor.push(await asVisitor('203.0.113.201', `proxy-same-${i}@example.com`));
+    expect('one visitor over the per-IP limit is refused even behind the proxy',
+      sameVisitor.filter(s => s === 429).length === 2, sameVisitor.join(','));
+    const spoofed = [];
+    for (let i = 0; i < 8; i++) spoofed.push(await asVisitor(`10.9.${i}.1, 203.0.113.202`, `proxy-spoof-${i}@example.com`));
+    expect('a forged first hop does not buy a fresh bucket',
+      spoofed.filter(s => s === 429).length === 2, spoofed.join(','));
+    const health = await (await fetch(`${proxyServer.base}/healthz`)).json();
+    expect('the health endpoint says the proxy is being read',
+      health.proxy && health.proxy.trustForwardedHeaders === true, JSON.stringify(health.proxy));
+  } finally {
+    await proxyServer.stop();
+    fs.rmSync(proxyLeadsDir, { recursive: true, force: true });
+  }
+
+  console.log('\nStatic file containment');
+  const rawPath = (send) => new Promise((resolve, reject) => {
+    const u = new URL(BASE);
+    const request = require('http').request({
+      hostname: u.hostname, port: u.port, path: send, method: 'GET', headers: { 'User-Agent': RUN_ID }
+    }, (response) => {
+      const chunks = [];
+      response.on('data', c => chunks.push(c));
+      response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+  const escapes = [
+    '/css/../server.js',
+    '/css/..%2f..%2fserver.js',
+    '/images/%2e%2e%2f%2e%2e%2fpackage.json',
+    '/js/%2e%2e/%2e%2e/lib/shopify/client.js',
+    '/css/%2e%2e%2f%2e%2e%2f.env',
+    '/css/%00/etc/passwd'
+  ];
+  for (const send of escapes) {
+    const got = await rawPath(send);
+    const leaked = /"engines"|require\('http'\)|SHOPIFY_STOREFRONT_ACCESS_TOKEN|root:/.test(got.body);
+    expect(`"${send}" serves nothing outside public/`,
+      (got.status === 404 || got.status === 400) && !leaked, `${got.status}${leaked ? ' — LEAKED SOURCE' : ''}`);
+  }
+  const realAsset = await rawPath('/css/main.css');
+  expect('a real asset still serves', realAsset.status === 200 && realAsset.body.length > 1000, String(realAsset.status));
+  const encodedAsset = await rawPath('/images/gift-card.svg');
+  expect('a percent-encoded-but-legitimate path still serves', encodedAsset.status === 200, String(encodedAsset.status));
+
+  console.log('\nHealth telemetry');
+  const health = await (await fetch(BASE + '/healthz')).json();
+  expect('/healthz reports the lead sink honestly',
+    health.leads && typeof health.leads.writable === 'boolean' && typeof health.leads.writeFailures === 'number',
+    JSON.stringify(health.leads));
+  expect('/healthz reports proxy trust',
+    health.proxy && typeof health.proxy.trustForwardedHeaders === 'boolean', JSON.stringify(health.proxy));
+  expect('a leaked lead write is never counted on a healthy sink',
+    health.leads.writable === true && health.leads.writeFailures === 0, JSON.stringify(health.leads));
 
   console.log('\nOutput encoding (XSS)');
   const payload = '<script>window.__xss=1</script>" onmouseover="alert(1)';
