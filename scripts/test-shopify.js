@@ -236,6 +236,139 @@ function expect(label, condition, detail = '') {
   }
   delete process.env.NODE_ENV;
 
+  /* ------------------------- client identity + throttling ------------------ */
+  console.log('\nClient identity, proxy trust and rate limiting');
+  const { makeLimiter } = require('../lib/ratelimit');
+  const locksLib = require('../lib/locks');
+  const proxied = (headers, sock = '10.0.0.7') => ({ headers, socket: { remoteAddress: sock } });
+  const savedVercel = process.env.VERCEL;
+  const savedRender = process.env.RENDER;
+  clearTransportEnv();
+  delete process.env.VERCEL;
+  delete process.env.RENDER;
+
+  expect('without a trusted proxy the socket address is the visitor',
+    auth.clientIp(proxied({ 'x-forwarded-for': '1.2.3.4' })) === '10.0.0.7');
+  expect('a client cannot become a different IP just by claiming one',
+    auth.clientIp(proxied({ 'x-forwarded-for': '8.8.8.8' })) === auth.clientIp(proxied({})));
+
+  process.env.TRUST_PROXY = '1';
+  expect('behind a proxy x-real-ip wins (the proxy writes it, a client cannot)',
+    auth.clientIp(proxied({ 'x-real-ip': '203.0.113.9', 'x-forwarded-for': '1.1.1.1, 203.0.113.9' })) === '203.0.113.9');
+  expect('otherwise the rightmost x-forwarded-for hop wins, never the client-chosen first one',
+    auth.clientIp(proxied({ 'x-forwarded-for': '1.1.1.1, 203.0.113.9' })) === '203.0.113.9');
+  expect('a proxy chain that appends still resolves to the real client',
+    auth.clientIp(proxied({ 'x-forwarded-for': ' 203.0.113.77 , ' })) === '203.0.113.77');
+  expect('a proxied request with no forwarded headers falls back to the socket',
+    auth.clientIp(proxied({})) === '10.0.0.7');
+  expect('every consumer agrees on the client identity',
+    security.clientIp(proxied({ 'x-forwarded-for': '9.9.9.9, 8.8.8.8' })) === require('../lib/ratelimit').getClientIp(proxied({ 'x-forwarded-for': '9.9.9.9, 8.8.8.8' })));
+
+  const buckets = makeLimiter();
+  const threeVisitors = [1, 2, 3].map(i => buckets.allow(proxied({ 'x-forwarded-for': `203.0.113.${i}` }), 'cart.discount', { windowMs: 60_000, max: 2 }));
+  expect('distinct visitors behind one proxy get distinct buckets',
+    threeVisitors.join(',') === 'true,true,true', threeVisitors.join(','));
+  const spoofLimiter = makeLimiter();
+  const forged = [1, 2, 3, 4, 5, 6, 7, 8].map(i => spoofLimiter.allow(
+    proxied({ 'x-forwarded-for': `10.9.${i}.1, 203.0.113.99` }), 'cart.discount', { windowMs: 60_000, max: 3 }));
+  expect('a forged first hop cannot mint a fresh bucket to escape a limit',
+    forged.filter(Boolean).length === 3, forged.map(v => (v ? 'ok' : '429')).join(','));
+  clearTransportEnv();
+  const directLimiter = makeLimiter();
+  const sameSocket = [1, 2, 3, 4].map(() => directLimiter.allow(proxied({}), 'cart.discount', { windowMs: 60_000, max: 3 }));
+  expect('one visitor is still throttled when nothing is proxied',
+    sameSocket.join(',') === 'true,true,true,false', sameSocket.join(','));
+
+  expect('a request with no socket at all is unknown, never a crash',
+    auth.clientIp({ headers: {} }) === 'unknown' && auth.clientIp(null) === 'unknown');
+  // The trap this guard exists for: an *unset* env var reads as the string
+  // "undefined" to a sloppy predicate, which would silently turn on forwarding
+  // trust (and therefore trust of a client-forgeable header) for everybody.
+  expect('an unset or placeholder platform variable is not a platform', (() => {
+    const results = [];
+    for (const value of ['', 'undefined', 'null', 'false', '0', 'no', '   ']) {
+      process.env.FLY_APP_NAME = value;
+      results.push(auth.trustsProxy() === false && auth.onProxyPlatform() === null);
+    }
+    process.env.FLY_APP_NAME = 'vennix-web';
+    const detected = auth.trustsProxy() === true && auth.onProxyPlatform() === 'FLY_APP_NAME';
+    delete process.env.FLY_APP_NAME;
+    return results.every(Boolean) && detected;
+  })(), 'a placeholder must not enable trust; a real app name must');
+  expect('an unrecognised TRUST_PROXY value does not enable trust',
+    (() => { process.env.TRUST_PROXY = 'maybe'; const off = auth.trustsProxy() === false; clearTransportEnv(); return off; })());
+  expect('a known platform proxy implies forwarded-header trust', (() => {
+    process.env.VERCEL = '1';
+    const auto = auth.trustsProxy() === true && auth.onProxyPlatform() === 'VERCEL';
+    process.env.TRUST_PROXY = '0';
+    const optOutWins = auth.trustsProxy() === false;
+    clearTransportEnv();
+    return auto && optOutWins;
+  })(), 'VERCEL=1 implies trust; TRUST_PROXY=0 still overrides it');
+  expect('Render is detected the same way', (() => {
+    process.env.RENDER = 'true';
+    const ok = auth.trustsProxy() === true;
+    clearTransportEnv();
+    return ok;
+  })());
+
+  expect('two visitors behind one proxy no longer share a cart-burst key', (() => {
+    process.env.TRUST_PROXY = '1';
+    const ua = 'Mozilla/5.0 (Windows NT 10.0) Chrome/140.0.0.0';
+    const a = locksLib.sessionKey(proxied({ 'user-agent': ua, 'x-forwarded-for': '203.0.113.5' }));
+    const b = locksLib.sessionKey(proxied({ 'user-agent': ua, 'x-forwarded-for': '198.51.100.9' }));
+    clearTransportEnv();
+    return !!a && !!b && a !== b;
+  })(), 'the socket address alone must not be the discriminator behind a proxy');
+  expect('an unidentifiable visitor is never matched to someone else\'s cart',
+    locksLib.sessionKey({ headers: { 'user-agent': 'curl/8.7' } }) === null);
+
+  if (savedVercel === undefined) delete process.env.VERCEL; else process.env.VERCEL = savedVercel;
+  if (savedRender === undefined) delete process.env.RENDER; else process.env.RENDER = savedRender;
+  clearTransportEnv();
+
+  /* ------------------------------ lead durability -------------------------- */
+  console.log('\nLead capture durability');
+  const leads = require('../lib/leads');
+  expect('the lead sink reports whether it can persist',
+    (() => { const s = leads.stats(); return typeof s.writeFailures === 'number' && typeof s.writable === 'boolean' && typeof s.file === 'string'; })(),
+    JSON.stringify(leads.stats()));
+  expect('a capture that cannot be written is counted and flagged, not swallowed', (() => {
+    const fss = require('fs');
+    const ppth = require('path');
+    const { execFileSync } = require('child_process');
+    const root = fss.mkdtempSync(ppth.join(require('os').tmpdir(), 'vennix-ro-'));
+    const dir = ppth.join(root, 'data');
+    fss.mkdirSync(dir, { recursive: true });
+    fss.chmodSync(dir, 0o500);
+    let unwritable = false;
+    try { fss.accessSync(dir, fss.constants.W_OK); } catch { unwritable = true; }
+    if (!unwritable) { // running as root: the filesystem refuses nothing, so there is nothing to assert
+      fss.chmodSync(dir, 0o700); fss.rmSync(root, { recursive: true, force: true });
+      return true;
+    }
+    try {
+      const out = execFileSync(process.execPath, ['-e', `
+        const leads = require(${JSON.stringify(ppth.join(__dirname, '..', 'lib', 'leads.js'))});
+        leads.insert('messages', { name: 'Shopper', email: 'a@b.co', message: 'hello' });
+        const written = leads.saveNow();
+        const s = leads.stats();
+        process.stdout.write(JSON.stringify({ written, failed: s.writeFailures > 0, flagged: s.writable === false }));
+      `], {
+        encoding: 'utf8',
+        env: { ...process.env, LEADS_DIR: dir, VENNIX_SKIP_ENV_FILE: '1', VENNIX_FORCE_INSECURE_COOKIES: '1' }
+      });
+      const parsed = JSON.parse(out);
+      return parsed.written === false && parsed.failed === true && parsed.flagged === true;
+    } catch (err) {
+      expect('   (child probe output)', false, String(err.stdout || err.message));
+      return false;
+    } finally {
+      fss.chmodSync(dir, 0o700);
+      fss.rmSync(root, { recursive: true, force: true });
+    }
+  })());
+
   /* ------------------------------------------------- pinned documents */
   console.log('\nPinned GraphQL documents (2026-07)');
   const ops = require('../lib/shopify/operations');

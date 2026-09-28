@@ -23,7 +23,7 @@
     "fixtures": "node scripts/build-fixtures.js"
   },
   "engines": {
-    "node": "24.x"
+    "node": ">=20.0.0"
   },
   "keywords": [
     "shopify",
